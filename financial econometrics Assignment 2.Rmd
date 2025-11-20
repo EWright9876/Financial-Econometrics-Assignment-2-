@@ -1,0 +1,248 @@
+---
+title: "Financial Econometrics 2"
+author: "Ethan Wright"
+date: "2025-11-01"
+output: pdf_document
+---
+
+
+Import data again
+```{r}
+library(tidyverse)
+library(xts)
+library(dynlm)
+VIX_df <- read_csv("C:\\Users\\bluee\\Downloads\\VIX_History (1).csv")
+
+VIX_df$logclose <-log(VIX_df$CLOSE)
+
+VIX_df$dt <- as.Date(VIX_df$DATE, format="%m/%d/%Y")
+
+VIX_xts <- xts(VIX_df$logclose, order.by =   VIX_df$dt)
+plot(VIX_xts)
+plot(x=VIX_df$dt, y= VIX_df$CLOSE,type="l")
+```
+Compute the autocorrelation function log returns, I will use a for loop up to a one business month (23 day) lag. 
+
+```{r}
+
+acf(VIX_xts, main ="ACF of log vix levels"  )
+pacf(VIX_xts, main ="PACF of log vix levels")
+
+library(tseries)
+library(modelsummary)
+library(forecast)
+adf.test(VIX_xts)
+
+
+
+levels_model<- arima(VIX_xts, order=c(1,0,0))
+print(levels_model$coef)
+
+coeftest(levels_model)
+
+
+```
+
+
+```{r}
+VIX_returns <- VIX_xts -lag(VIX_xts,1)
+acf(VIX_returns, na.action = na.pass ,type="correlation", main ="ACF of VIX returns", lag.max = 100)
+pacf(VIX_returns, na.action = na.pass, main ="PACF of VIX returns")
+
+
+returns_model <- ar(VIX_returns, aic= TRUE, na.action =na.pass)
+print(returns_model)
+Box.test(VIX_returns, lag=11, type="Ljung-Box")
+
+```
+```{r}
+stargazer( returns_model, type = "latex", title = "Returns AR model results", out= "returns_AR.tex")
+
+
+```
+
+
+```{r}
+colnames(VIX_returns) <- "VIX_returns"  
+
+VIX_zoo <- as.zoo(VIX_returns)
+
+regress <- dynlm(VIX_returns ~ L(VIX_returns, 1) + I(L(VIX_returns, 1)^2), data = VIX_zoo)
+
+
+summary(regress)
+library(stargazer)
+stargazer(regress, type="latex")
+```
+
+
+```{r}
+resids <- residuals(regress)
+print(resids)
+sqresid <- resids^2
+
+acf(resids, na.action = na.pass)
+acf(sqresid, na.action = na.pass)
+
+resids_df <- fortify.zoo(resids)
+
+```
+
+
+
+```{r}
+avg<- mean(resids_df)
+std_dev <- sqrt(var(resids_df))
+ggplot(resids_df, aes(x = resids)) +
+  
+  geom_histogram(binwidth = .01, fill = "steelblue", color = "black") +
+  labs(title = "Histogram of residuals",
+       x = "Value",
+       y = "Frequency") +
+  
+  theme_minimal()
+
+
+qqnorm(resids_df$resids, main="Q-Q plot of distribution of residuals")
+qqline(resids_df$resids)
+```
+
+Create many day changes.
+```{r}
+library(xts)
+
+
+
+# --- Parameters ---
+max_h <- 100   # maximum horizon
+
+# --- Loop through horizons and create separate xts objects ---
+for (h in 1:max_h) {
+  n <- NROW(VIX_returns)
+  split_idx <- split(1:n, ceiling(seq_along(VIX_returns) / h))
+  
+  # Sum log returns over non-overlapping blocks
+  cum_ret <- sapply(split_idx, function(i) sum(VIX_returns[i]))
+  
+  # Use last date of each block
+  cum_dates <- index(VIX_returns)[sapply(split_idx, tail, 1)]
+  
+  # Create xts for this horizon
+  cum_xts <- xts(cum_ret, order.by = cum_dates)
+  colnames(cum_xts) <- paste0("cum_", h, "d")
+  
+  # Dynamically assign name like cum_xts_5
+  assign(paste0("cum_xts_", h), cum_xts)
+}
+
+# --- Example: check some of them ---
+head(cum_xts_1)
+head(cum_xts_5)
+head(cum_xts_10)
+
+```
+
+create linear regression
+
+```{r}
+library(xts)
+library(zoo)
+library(dynlm)
+
+# --- collect all cum_xts objects you created earlier ---
+cum_list <- mget(ls(pattern = "^cum_xts_"))
+
+reg_results <- list()
+coef_summary <- data.frame(
+  horizon = character(0),
+  beta = numeric(0),
+  t_stat = numeric(0),
+  p_value = numeric(0),
+  n_obs = integer(0),
+  stringsAsFactors = FALSE
+)
+
+for (name in names(cum_list)) {
+  y_xts <- cum_list[[name]]
+  # drop NA rows
+  y_xts <- na.omit(y_xts)
+  
+  # need at least 2 observations to regress on a lag
+  if (NROW(y_xts) < 2) {
+    reg_results[[name]] <- NA
+    coef_summary <- rbind(coef_summary, data.frame(
+      horizon = name, beta = NA, t_stat = NA, p_value = NA, n_obs = NROW(y_xts)
+    ))
+    next
+  }
+  
+  # ensure single column named 'y' and convert to zoo
+  colnames(y_xts) <- "y"
+  y_zoo <- as.zoo(y_xts)
+  
+  # run DynLM: y_t ~ y_{t-1}
+  model <- dynlm(y ~ L(y, 1), data = y_zoo)
+  reg_results[[name]] <- summary(model)
+  
+  # extract coefficient info for the lagged term
+  coef_mat <- coef(summary(model))
+  # If model has intercept and lag, the lag row is "L(y, 1)"
+  if ("L(y, 1)" %in% rownames(coef_mat)) {
+    beta  <- coef_mat["L(y, 1)", "Estimate"]
+    tstat <- coef_mat["L(y, 1)", "t value"]
+    pval  <- coef_mat["L(y, 1)", "Pr(>|t|)"]
+  } else {
+    # fallback (unlikely): set NAs
+    beta <- tstat <- pval <- NA
+  }
+  
+  coef_summary <- rbind(coef_summary, data.frame(
+    horizon = name,
+    beta = beta,
+    t_stat = tstat,
+    p_value = pval,
+    n_obs = NROW(y_xts),
+    stringsAsFactors = FALSE
+  ))
+}
+
+
+print(coef_summary)
+
+```
+
+
+```{r}
+coef_summary$R2 <- sapply(names(reg_results), function(name) {
+  model_sum <- reg_results[[name]]
+  
+  if (is.null(model_sum) || all(is.na(model_sum))) {
+    return(NA)
+  } else {
+    return(model_sum$r.squared)
+  }
+})
+
+
+
+coef_summary$h <- as.numeric(sub("cum_xts_", "", coef_summary$horizon))
+
+
+library(ggplot2)
+library(tidyr)
+
+# Reshape data for plotting
+plot_data <- coef_summary %>%
+  select(h, beta, R2) %>%
+  pivot_longer(cols = c("beta", "R2"), names_to = "metric", values_to = "value")
+
+ggplot(plot_data, aes(x = h, y = value, color = metric)) +
+  geom_line() +
+  geom_point() +
+  scale_color_manual(values = c("blue", "red")) +
+  labs(x = "Horizon (h)", y = "Value", color = "", 
+       title = "Lag Regression Beta and R² vs Horizon") +
+  theme_minimal()
+
+
+```
